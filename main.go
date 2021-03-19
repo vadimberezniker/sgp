@@ -94,10 +94,17 @@ func parseBuildFile(buildFilePath string) (*parsedBuildFile, error) {
 	}, nil
 }
 
-func processWorkspace(workspaceRoot string) error {
+type result struct {
+	created  int
+	upToDate int
+}
+
+func processWorkspace(workspaceRoot string) (*result, error) {
+	fmt.Printf("Processing directory %s\n", workspaceRoot)
+
 	_, err := os.Stat(filepath.Join(workspaceRoot, "WORKSPACE"))
 	if err != nil {
-		return fmt.Errorf("%q does not appear to be a Bazel workspace (no WORKSPACE file): %s", workspaceRoot, err)
+		return nil, fmt.Errorf("%q does not appear to be a Bazel workspace (no WORKSPACE file): %s", workspaceRoot, err)
 	}
 	var protoFiles []string
 	err = filepath.Walk(workspaceRoot, func(path string, info os.FileInfo, err error) error {
@@ -111,8 +118,10 @@ func processWorkspace(workspaceRoot string) error {
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	result := &result{}
 
 	buildFiles := make(map[string]*parsedBuildFile)
 
@@ -123,76 +132,70 @@ func processWorkspace(workspaceRoot string) error {
 		if _, err := os.Stat(buildFilePath); err != nil {
 			continue
 		}
-		fmt.Printf("Processing %s\n", protoFile)
 		buildFile := buildFiles[buildFilePath]
 		if buildFile == nil {
 			buildFile, err = parseBuildFile(buildFilePath)
 			if err != nil {
-				return fmt.Errorf("could not parse BUILD file %q: %v", buildFilePath, err)
+				return nil, fmt.Errorf("could not parse BUILD file %q: %v", buildFilePath, err)
 			}
 			buildFiles[buildFilePath] = buildFile
 		}
 
 		goRule, ok := buildFile.getGoRuleForProto(protoFile)
 		if !ok {
-			return fmt.Errorf("could not figure out go proto rule for %q", protoFile)
+			return nil, fmt.Errorf("could not figure out go proto rule for %q", protoFile)
 		}
-		fmt.Printf("Maps to %+v\n", goRule)
 		workspaceRelativePath := githubRepoRe.ReplaceAllLiteralString(goRule.importPath, "")
 		if workspaceRelativePath == goRule.importPath {
-			return fmt.Errorf("could not figure out workspace relative path for import %s", goRule.importPath)
+			return nil, fmt.Errorf("could not figure out workspace relative path for import %s", goRule.importPath)
 		}
 
 		protoFileBasename := filepath.Base(protoFile)
 
 		linkSrcDir := filepath.Join(workspaceRoot, workspaceRelativePath)
 		if err := os.MkdirAll(linkSrcDir, 0700); err != nil {
-			return fmt.Errorf("could not make directory %q: %v", linkSrcDir, err)
+			return nil, fmt.Errorf("could not make directory %q: %v", linkSrcDir, err)
 		}
 		linkSrcFile := strings.TrimSuffix(protoFileBasename, ".proto") + ".pb.go"
 		linkSrc := filepath.Join(linkSrcDir, linkSrcFile)
 
-		// fmt.Printf("workspace path: %s\n", linkSrcDir)
-		// fmt.Printf("file name: %s\n", linkSrcFile)
-
 		protoFileRelPath := strings.TrimPrefix(protoFile, workspaceRoot)
 		genProtoAbsPath := filepath.Join(workspaceRoot, "bazel-bin", filepath.Dir(protoFileRelPath), goRule.name+"_", goRule.importPath, linkSrcFile)
-		// if _, err := os.Stat(linkDst); err != nil {
-		// 	log.Fatalf("%s does not exist", linkDst)
-		// }
-
-		// fmt.Printf("link destination: %s\n", genProtoAbsPath)
 
 		s, err := os.Lstat(linkSrc)
 		if err == nil {
 			if s.Mode()&os.ModeSymlink == 0 {
-				return fmt.Errorf("%s already exists and is not a symlink", linkSrc)
+				return nil, fmt.Errorf("%s already exists and is not a symlink", linkSrc)
 			}
 			existingTarget, err := os.Readlink(linkSrc)
 			if err != nil {
-				return fmt.Errorf("could not read symlink %q: %v", linkSrc, err)
+				return nil, fmt.Errorf("could not read symlink %q: %v", linkSrc, err)
 			}
 			// cautious for now but we should probably just overwrite the symlink
 			if existingTarget != genProtoAbsPath {
-				return fmt.Errorf("symlink %s already exists and points to a different location", linkSrc)
+				return nil, fmt.Errorf("symlink %s already exists and points to a different location", linkSrc)
 			}
+			result.upToDate++
 		} else {
 			if err := os.Symlink(genProtoAbsPath, linkSrc); err != nil {
-				return fmt.Errorf("could not create symlink from %q to %q: %v", genProtoAbsPath, linkSrc, err)
+				return nil, fmt.Errorf("could not create symlink from %q to %q: %v", genProtoAbsPath, linkSrc, err)
 			}
+			fmt.Printf("Created symlink for %s\n", protoFile)
+			result.created++
 		}
 	}
-	return nil
+	return result, nil
 }
 
 func main() {
 	flag.Parse()
 
 	for _, dir := range strings.Split(*dirs, ",") {
-		err := processWorkspace(dir)
+		result, err := processWorkspace(dir)
 		if err != nil {
 			fmt.Printf("Could not process workspace %s: %v\n", dir, err)
 			os.Exit(1)
 		}
+		fmt.Printf("SYMLINKS CREATED: %d, UP TO DATE: %d\n", result.created, result.upToDate)
 	}
 }
