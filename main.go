@@ -12,32 +12,66 @@ import (
 	"github.com/bazelbuild/buildtools/build"
 )
 
+const (
+	goProtoLibrary = "go_proto_library"
+	tsProtoLibrary = "ts_proto_library"
+)
+
 var (
 	dirs = flag.String("dirs", "", "Bazel workspaces to process")
 
 	githubRepoRe = regexp.MustCompile(`^github.com/(.+?)/(.+?)/`)
 )
 
-type goRule struct {
-	name, protoRuleName, importPath string
+type languageProtoRule struct {
+	kind, name, protoRuleName, importPath string
+}
+
+func (r *languageProtoRule) getLinkAndTarget(workspaceRoot, protoFile string) (string, string, error) {
+	protoFileRelPath := strings.TrimPrefix(protoFile, workspaceRoot)
+	switch r.kind {
+	case goProtoLibrary:
+		workspaceRelativePath := githubRepoRe.ReplaceAllLiteralString(r.importPath, "")
+		if workspaceRelativePath == r.importPath {
+			return "", "", fmt.Errorf("could not figure out workspace relative path for import %q", r.importPath)
+		}
+
+		protoFileBasename := filepath.Base(protoFile)
+
+		linkSrcDir := filepath.Join(workspaceRoot, workspaceRelativePath)
+		if err := os.MkdirAll(linkSrcDir, 0700); err != nil {
+			return "", "", fmt.Errorf("could not make directory %q: %v", linkSrcDir, err)
+		}
+		linkSrcFile := strings.TrimSuffix(protoFileBasename, ".proto") + ".pb.go"
+		linkSrc := filepath.Join(linkSrcDir, linkSrcFile)
+
+		genProtoAbsPath := filepath.Join(workspaceRoot, "bazel-bin", filepath.Dir(protoFileRelPath), r.name+"_", r.importPath, linkSrcFile)
+
+		return linkSrc, genProtoAbsPath, nil
+	case tsProtoLibrary:
+		linkSrc := filepath.Join(workspaceRoot, filepath.Dir(protoFileRelPath), r.name + ".d.ts")
+		genProtoAbsPath := filepath.Join(workspaceRoot, "bazel-bin", filepath.Dir(protoFileRelPath), r.name+".d.ts")
+		return linkSrc, genProtoAbsPath, nil
+	}
+	return "", "", fmt.Errorf("unknown proto rule kind %q", r.kind)
 }
 
 type parsedBuildFile struct {
-	protoFileToRule   map[string]string
-	protoRuleToGoRule map[string]goRule
+	protoFileToRule           map[string]string
+	protoRuleToLangProtoRules map[string][]languageProtoRule
 }
 
-func (b *parsedBuildFile) getGoRuleForProto(protoFile string) (*goRule, bool) {
+func (b *parsedBuildFile) getLangProtoRulesForProto(protoFile string) ([]languageProtoRule, bool) {
 	basename := filepath.Base(protoFile)
 	protoRule, ok := b.protoFileToRule[basename]
 	if !ok {
 		return nil, false
 	}
-	goRule, ok := b.protoRuleToGoRule[protoRule]
+	langRules, ok := b.protoRuleToLangProtoRules[protoRule]
 	if !ok {
 		return nil, false
 	}
-	return &goRule, true
+	return langRules, true
 }
 
 func parseBuildFile(buildFilePath string) (*parsedBuildFile, error) {
@@ -66,10 +100,14 @@ func parseBuildFile(buildFilePath string) (*parsedBuildFile, error) {
 		}
 	}
 
-	protoRuleToGoRule := make(map[string]goRule)
+	protoRuleToLangProtoRules := make(map[string][]languageProtoRule)
 
-	goProtoRules := buildFile.Rules("go_proto_library")
+	goProtoRules := buildFile.Rules("")
 	for _, r := range goProtoRules {
+		if r.Kind() != goProtoLibrary && r.Kind() != tsProtoLibrary {
+			continue
+		}
+
 		protoRule := r.AttrString("proto")
 		if protoRule == "" {
 			return nil, fmt.Errorf("%s: go proto rule %q missing proto attribute", buildFilePath, r.Name())
@@ -77,26 +115,71 @@ func parseBuildFile(buildFilePath string) (*parsedBuildFile, error) {
 		if !strings.HasPrefix(protoRule, ":") {
 			return nil, fmt.Errorf("%s: go proto rule %q has unsupported proto reference: %s", buildFilePath, r.Name(), protoRule)
 		}
-		importPath := r.AttrString("importpath")
-		if importPath == "" {
-			return nil, fmt.Errorf("%s: go proto rule %q missing importpath attribute", buildFilePath, r.Name())
+
+		importPath := ""
+		if r.Kind() == goProtoLibrary {
+			importPath = r.AttrString("importpath")
+			if importPath == "" {
+				return nil, fmt.Errorf("%s: go proto rule %q missing importpath attribute", buildFilePath, r.Name())
+			}
 		}
-		protoRuleToGoRule[protoRule[1:]] = goRule{
+
+		protoRuleName := protoRule[1:]
+		langProtoRule := languageProtoRule{
+			kind:          r.Kind(),
 			name:          r.Name(),
 			protoRuleName: protoRule[1:],
 			importPath:    importPath,
 		}
+		protoRuleToLangProtoRules[protoRuleName] = append(protoRuleToLangProtoRules[protoRuleName], langProtoRule)
 	}
 
 	return &parsedBuildFile{
-		protoFileToRule:   protoFileToRule,
-		protoRuleToGoRule: protoRuleToGoRule,
+		protoFileToRule:           protoFileToRule,
+		protoRuleToLangProtoRules: protoRuleToLangProtoRules,
 	}, nil
 }
 
 type result struct {
 	created  int
 	upToDate int
+}
+
+func processProtoFile(workspaceRoot string, protoFile string, buildFile *parsedBuildFile, result *result) error {
+	langRules, ok := buildFile.getLangProtoRulesForProto(protoFile)
+	if !ok {
+		return fmt.Errorf("could not figure out go proto rule for %q", protoFile)
+	}
+
+	for _, langRule := range langRules {
+		link, linkTarget, err := langRule.getLinkAndTarget(workspaceRoot, protoFile)
+		if err != nil {
+			return err
+		}
+
+		s, err := os.Lstat(link)
+		if err == nil {
+			if s.Mode()&os.ModeSymlink == 0 {
+				return fmt.Errorf("%s already exists and is not a symlink", link)
+			}
+			existingTarget, err := os.Readlink(link)
+			if err != nil {
+				return fmt.Errorf("could not read symlink %q: %v", link, err)
+			}
+			// cautious for now but we should probably just overwrite the symlink
+			if existingTarget != linkTarget {
+				return fmt.Errorf("symlink %s already exists and points to a different location", link)
+			}
+			result.upToDate++
+		} else {
+			if err := os.Symlink(linkTarget, link); err != nil {
+				return fmt.Errorf("could not create symlink from %q to %q: %v", linkTarget, link, err)
+			}
+			fmt.Printf("Created symlink for %s\n", protoFile)
+			result.created++
+		}
+	}
+	return nil
 }
 
 func processWorkspace(workspaceRoot string) (*result, error) {
@@ -141,54 +224,21 @@ func processWorkspace(workspaceRoot string) (*result, error) {
 			buildFiles[buildFilePath] = buildFile
 		}
 
-		goRule, ok := buildFile.getGoRuleForProto(protoFile)
-		if !ok {
-			return nil, fmt.Errorf("could not figure out go proto rule for %q", protoFile)
-		}
-		workspaceRelativePath := githubRepoRe.ReplaceAllLiteralString(goRule.importPath, "")
-		if workspaceRelativePath == goRule.importPath {
-			return nil, fmt.Errorf("could not figure out workspace relative path for import %s", goRule.importPath)
+		if err := processProtoFile(workspaceRoot, protoFile, buildFile, result); err != nil {
+			return nil, err
 		}
 
-		protoFileBasename := filepath.Base(protoFile)
-
-		linkSrcDir := filepath.Join(workspaceRoot, workspaceRelativePath)
-		if err := os.MkdirAll(linkSrcDir, 0700); err != nil {
-			return nil, fmt.Errorf("could not make directory %q: %v", linkSrcDir, err)
-		}
-		linkSrcFile := strings.TrimSuffix(protoFileBasename, ".proto") + ".pb.go"
-		linkSrc := filepath.Join(linkSrcDir, linkSrcFile)
-
-		protoFileRelPath := strings.TrimPrefix(protoFile, workspaceRoot)
-		genProtoAbsPath := filepath.Join(workspaceRoot, "bazel-bin", filepath.Dir(protoFileRelPath), goRule.name+"_", goRule.importPath, linkSrcFile)
-
-		s, err := os.Lstat(linkSrc)
-		if err == nil {
-			if s.Mode()&os.ModeSymlink == 0 {
-				return nil, fmt.Errorf("%s already exists and is not a symlink", linkSrc)
-			}
-			existingTarget, err := os.Readlink(linkSrc)
-			if err != nil {
-				return nil, fmt.Errorf("could not read symlink %q: %v", linkSrc, err)
-			}
-			// cautious for now but we should probably just overwrite the symlink
-			if existingTarget != genProtoAbsPath {
-				return nil, fmt.Errorf("symlink %s already exists and points to a different location", linkSrc)
-			}
-			result.upToDate++
-		} else {
-			if err := os.Symlink(genProtoAbsPath, linkSrc); err != nil {
-				return nil, fmt.Errorf("could not create symlink from %q to %q: %v", genProtoAbsPath, linkSrc, err)
-			}
-			fmt.Printf("Created symlink for %s\n", protoFile)
-			result.created++
-		}
 	}
 	return result, nil
 }
 
 func main() {
 	flag.Parse()
+
+	if *dirs == "" {
+		fmt.Printf("Please specify --dirs")
+		os.Exit(1)
+	}
 
 	for _, dir := range strings.Split(*dirs, ",") {
 		result, err := processWorkspace(dir)
