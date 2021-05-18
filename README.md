@@ -4,5 +4,4 @@ It does this by creating symlinks to the generated protos in locations where the
 
 To use the tool run `go run main.go --dirs /path/to/bazel/workspace`
 
-
-
+Don't forget to build the proto targets using Bazel as the symlinks point to the generated protos in the bazel-bin directory.
