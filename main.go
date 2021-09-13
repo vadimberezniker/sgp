@@ -49,7 +49,7 @@ func (r *languageProtoRule) getLinkAndTarget(workspaceRoot, protoFile string) (s
 
 		return linkSrc, genProtoAbsPath, nil
 	case tsProtoLibrary:
-		linkSrc := filepath.Join(workspaceRoot, filepath.Dir(protoFileRelPath), r.name + ".d.ts")
+		linkSrc := filepath.Join(workspaceRoot, filepath.Dir(protoFileRelPath), r.name+".d.ts")
 		genProtoAbsPath := filepath.Join(workspaceRoot, "bazel-bin", filepath.Dir(protoFileRelPath), r.name+".d.ts")
 		return linkSrc, genProtoAbsPath, nil
 	}
@@ -113,7 +113,8 @@ func parseBuildFile(buildFilePath string) (*parsedBuildFile, error) {
 			return nil, fmt.Errorf("%s: go proto rule %q missing proto attribute", buildFilePath, r.Name())
 		}
 		if !strings.HasPrefix(protoRule, ":") {
-			return nil, fmt.Errorf("%s: go proto rule %q has unsupported proto reference: %s", buildFilePath, r.Name(), protoRule)
+			fmt.Printf("%s: go proto rule %q has unsupported proto reference: %s\n", buildFilePath, r.Name(), protoRule)
+			continue
 		}
 
 		importPath := ""
@@ -225,7 +226,7 @@ func processWorkspace(workspaceRoot string) (*result, error) {
 		}
 
 		if err := processProtoFile(workspaceRoot, protoFile, buildFile, result); err != nil {
-			return nil, err
+			fmt.Printf("Skipping %q: %s\n", protoFile, err)
 		}
 
 	}
